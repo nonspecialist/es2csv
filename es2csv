@@ -1,0 +1,24 @@
+#!/bin/sh
+#
+# Wrapper for Dockerized es2csv
+#
+
+echo ARGS ARE "$@"
+
+# parse enough of the arguments to work out the directory to mount for output
+while [ $# -ge 1 ]; do
+    case $1 in
+        -o) DEST=$(basename $2); DEST_DIR=$(dirname $2); shift 2 ;;
+        *) ARGS="$ARGS $1"; shift ;;
+    esac
+done
+
+# Run as the calling user so we can write to the destination appropriately
+SYSTEM=$( uname -s )
+case $SYSTEM in
+    Linux|Darwin) USERID=$( id -u ); GID=$( id -g ) ;;
+    *) echo "Cannot determine userid"; exit 1 ;;
+esac
+
+echo docker run -u $USERID:$GID -v $DEST_DIR:/output es2csv -o /output/$DEST $ARGS
+docker run -u $USERID:$GID -v $DEST_DIR:/output es2csv -o /output/$DEST $ARGS
