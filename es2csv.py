@@ -19,6 +19,8 @@ import json
 import csv
 import elasticsearch
 import progressbar
+import datetime
+from dateutil.parser import *
 from functools import wraps
 
 FLUSH_BUFFER = 1000  # Chunk of docs to flush in temp file
@@ -67,6 +69,74 @@ class Es2csv:
 
         self.csv_headers = list(META_FIELDS) if self.opts.meta_fields else []
         self.tmp_file = '%s.tmp' % opts.output_file
+        self.all_indexes = None
+
+    @retry(elasticsearch.exceptions.ConnectionError, tries=TIMES_TO_TRY)
+    def index_created_time(self, idx):
+        res = self.es_conn.indices.get(index=idx, feature='_settings')
+        created = float(res[idx]['settings']['index']['creation_date']) / 1000
+        if self.opts.debug_mode:
+            print('Index %s was created at %f' % (idx, created))
+        return datetime.datetime.utcfromtimestamp(created)
+
+    # uses the following query syntax to determine the date of the last document in an index:
+    # GET /indexname/_search
+    # {
+    #   "query": { "match_all": {} },
+    #   "size": 1,
+    #   "sort": [ { "@timestamp": { "order": "desc" } } ]
+    # }
+    # and then pull out the hits.hits[0].sort field, which is an epoch-second timestamp
+    @retry(elasticsearch.exceptions.ConnectionError, tries=TIMES_TO_TRY)
+    def index_last_doc_time(self, idx):
+        query = '{"query":{"match_all":{}},"size":1,"sort":[{"@timestamp":{"order":"desc"}}]}'
+        res = self.es_conn.search(idx, '', query)
+        last_doc = float(res['hits']['hits'][0]['sort'][0]) / 1000
+        if self.opts.debug_mode:
+            print('Last document in index %s put at %f' % (idx, last_doc))
+        return datetime.datetime.utcfromtimestamp(last_doc)
+
+    # Find which index contains a given date
+    @retry(elasticsearch.exceptions.ConnectionError, tries=TIMES_TO_TRY)
+    def index_for_when(self, pattern, when):
+        for idx in self.all_indexes:
+            start = self.index_created_time(idx)
+            end = self.index_last_doc_time(idx)
+            if start < when < end:
+                if self.opts.debug_mode:
+                    print('found index %s for when %s' % (idx, when))
+                return idx
+
+        if self.opts.debug_mode:
+            print('found no index that covered %s' % when)
+
+        return None
+
+    def indexes_covering_range(self, pattern, start, end):
+        self.all_indexes = [idx['index'] for idx in self.es_conn.cat.indices(index=pattern, format='json', pri=True)]
+        first = self.index_for_when(pattern, start)
+        last = self.index_for_when(pattern, end)
+        if first is None or last is None:
+            print('No indexes cover that time range')
+            exit(1)
+
+        if first == last:
+            return [first]
+
+        use = False
+        indexes = []
+        for idx in self.all_indexes:
+            if idx == start:
+                use = True
+
+            if use:
+                indexes.append(idx)
+
+            if idx == end:
+                use = False
+
+        return indexes
+
 
     @retry(elasticsearch.exceptions.ConnectionError, tries=TIMES_TO_TRY)
     def create_connection(self):
@@ -91,8 +161,25 @@ class Es2csv:
         @retry(elasticsearch.exceptions.ConnectionError, tries=TIMES_TO_TRY)
         def next_scroll(scroll_id):
             return self.es_conn.scroll(scroll=self.scroll_time, scroll_id=scroll_id)
+        if self.opts.start_time or self.opts.end_time:
+            indexes = ','.join(self.indexes_covering_range(self.opts.index_prefixes, self.opts.start_time, self.opts.end_time))
+            if self.opts.raw_query:
+                query_addition = {
+                    'range': {
+                        '@timestamp': {
+                            'gte': self.opts.start_time.isoformat(),
+                            'lt': self.opts.end_time.isoformat(),
+                        }
+                    }
+                }
+            else:
+                query_addition = ' AND @timestamp:["%s" TO "%s"]' % (self.opts.start_time.isoformat(), self.opts.end_time.isoformat())
+            print("Searching indexes %s with addition %r" % (indexes, query_addition))
+        else:
+            indexes = ','.join(self.opts.index_prefixes)
+
         search_args = dict(
-            index=','.join(self.opts.index_prefixes),
+            index=indexes,
             scroll=self.scroll_time,
             size=self.opts.scroll_size,
             terminate_after=self.opts.max_results
@@ -112,6 +199,10 @@ class Es2csv:
         if self.opts.raw_query:
             try:
                 query = json.loads(self.opts.query)
+                if query_addition:
+                    # we need to add the "range" inside a "bool -> must" list
+                    query = { 'query': { 'bool': { 'must': [ query_addition, query['query'] ] } } }
+                    print('new query is: %s' % json.dumps(query))
             except ValueError as e:
                 print('Invalid JSON syntax in query. %s' % e)
                 exit(1)
@@ -119,6 +210,8 @@ class Es2csv:
         else:
             query = self.opts.query if not self.opts.tags else '%s AND tags:%s' % (
                 self.opts.query, '(%s)' % ' AND '.join(self.opts.tags))
+            if query_addition:
+                query = query + query_addition
             search_args['q'] = query
 
         if '_all' not in self.opts.fields:
@@ -126,7 +219,7 @@ class Es2csv:
             self.csv_headers.extend([field for field in self.opts.fields if '*' not in field])
 
         if self.opts.debug_mode:
-            print('Using these indices: %s' % ', '.join(self.opts.index_prefixes))
+            print('Using these indices: %s' % indexes)
             print('Query[%s]: %s' % (('Query DSL', json.dumps(query)) if self.opts.raw_query else ('Lucene', query)))
             print('Output field(s): %s' % ', '.join(self.opts.fields))
 
@@ -249,12 +342,30 @@ class Es2csv:
             pass
 
 
+class parseWhen(argparse.Action):
+    def __init__(self, option_strings, dest, nargs=None, **kwargs):
+        if nargs is not None:
+            raise ValueError("parseWhen cannot handle >1 argument")
+        super(parseWhen, self).__init__(option_strings, dest, **kwargs)
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        if 'now' == values:
+            when = datetime.datetime.now()
+        elif 'yesterday' == values:
+            day = datetime.timedelta(1)
+            when = datetime.datetime.now() - day
+        else:
+            when = parse(values)
+        setattr(namespace, self.dest, when)
+
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument('-q', '--query', dest='query', type=str, required=True, help='Query string in Lucene syntax.')
     p.add_argument('-u', '--url', dest='url', default='http://localhost:9200', type=str, help='Elasticsearch host URL. Default is %(default)s.')
     p.add_argument('-a', '--auth', dest='auth', type=str, required=False, help='Elasticsearch basic authentication in the form of username:password.')
     p.add_argument('-i', '--index-prefixes', dest='index_prefixes', default=['logstash-*'], type=str, nargs='+', metavar='INDEX', help='Index name prefix(es). Default is %(default)s.')
+    p.add_argument('-S', '--start-time', dest='start_time', type=str, action=parseWhen, metavar='TIME', help='Starting time to dump from. Default is %(default)s')
+    p.add_argument('-E', '--end-time', dest='end_time', type=str, action=parseWhen, metavar='TIME', help='End time to dump to. Default is %(default)s.')
     p.add_argument('-D', '--doc_types', dest='doc_types', type=str, nargs='+', metavar='DOC_TYPE', help='Document type(s).')
     p.add_argument('-t', '--tags', dest='tags', type=str, nargs='+', help='Query tags.')
     p.add_argument('-o', '--output_file', dest='output_file', type=str, required=True, metavar='FILE', help='CSV file location.')
@@ -277,6 +388,12 @@ def main():
         exit()
 
     opts = p.parse_args()
+
+    if (opts.start_time and not opts.end_time) or (opts.end_time and not opts.start_time):
+        print("Must specify both start and end times")
+        p.print_help()
+        exit()
+
     es = Es2csv(opts)
     es.create_connection()
     es.check_indexes()
