@@ -20,6 +20,7 @@ import csv
 import elasticsearch
 import progressbar
 import datetime
+import pytz
 from dateutil.parser import *
 from functools import wraps
 
@@ -30,6 +31,8 @@ RETRY_DELAY = 60
 META_FIELDS = ['_id', '_index', '_score', '_type']
 __version__ = '5.2.1'
 
+# used in localising naiive datetimes
+utc = pytz.UTC
 
 # Retry decorator for functions with exceptions
 def retry(ExceptionToCheck, tries=TIMES_TO_TRY, delay=RETRY_DELAY):
@@ -77,7 +80,7 @@ class Es2csv:
         created = float(res[idx]['settings']['index']['creation_date']) / 1000
         if self.opts.debug_mode:
             print('Index %s was created at %f' % (idx, created))
-        return datetime.datetime.utcfromtimestamp(created)
+        return utc.localize(datetime.datetime.utcfromtimestamp(created))
 
     # uses the following query syntax to determine the date of the last document in an index:
     # GET /indexname/_search
@@ -94,7 +97,7 @@ class Es2csv:
         last_doc = float(res['hits']['hits'][0]['sort'][0]) / 1000
         if self.opts.debug_mode:
             print('Last document in index %s put at %f' % (idx, last_doc))
-        return datetime.datetime.utcfromtimestamp(last_doc)
+        return utc.localize(datetime.datetime.utcfromtimestamp(last_doc))
 
     # Find which index contains a given date
     @retry(elasticsearch.exceptions.ConnectionError, tries=TIMES_TO_TRY)
@@ -356,6 +359,16 @@ class parseWhen(argparse.Action):
             when = datetime.datetime.now() - day
         else:
             when = parse(values)
+
+        try:
+            if when.utcoffset() is None:
+                when = utc.localize(when)
+            else:
+                when = utc.normalize(when)
+        except ValueError:
+            # we get this when the TZ is already set
+            pass
+
         setattr(namespace, self.dest, when)
 
 def main():
