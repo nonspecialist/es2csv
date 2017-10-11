@@ -78,8 +78,6 @@ class Es2csv:
     def index_created_time(self, idx):
         res = self.es_conn.indices.get(index=idx, feature='_settings')
         created = float(res[idx]['settings']['index']['creation_date']) / 1000
-        if self.opts.debug_mode:
-            print('Index %s was created at %f' % (idx, created))
         return utc.localize(datetime.datetime.utcfromtimestamp(created))
 
     # uses the following query syntax to determine the date of the last document in an index:
@@ -95,20 +93,21 @@ class Es2csv:
         query = '{"query":{"match_all":{}},"size":1,"sort":[{"@timestamp":{"order":"desc"}}]}'
         res = self.es_conn.search(idx, '', query)
         last_doc = float(res['hits']['hits'][0]['sort'][0]) / 1000
-        if self.opts.debug_mode:
-            print('Last document in index %s put at %f' % (idx, last_doc))
         return utc.localize(datetime.datetime.utcfromtimestamp(last_doc))
+
+    # Fetch all indexes
+    @retry(elasticsearch.exceptions.ConnectionError, tries=TIMES_TO_TRY)
+    def fetch_indexes(self, pattern):
+        self.all_indexes = self.es_conn.cat.indices(index=pattern, format='json', pri=True, s='index')
 
     # Find which index contains a given date
     @retry(elasticsearch.exceptions.ConnectionError, tries=TIMES_TO_TRY)
-    def index_for_when(self, pattern, when):
+    def index_for_when(self, when):
         for idx in self.all_indexes:
-            start = self.index_created_time(idx)
-            end = self.index_last_doc_time(idx)
+            start = self.index_created_time(idx['index'])
+            end = self.index_last_doc_time(idx['index'])
             if start < when < end:
-                if self.opts.debug_mode:
-                    print('found index %s for when %s' % (idx, when))
-                return idx
+                return idx['index']
 
         if self.opts.debug_mode:
             print('found no index that covered %s' % when)
@@ -116,9 +115,9 @@ class Es2csv:
         return None
 
     def indexes_covering_range(self, pattern, start, end):
-        self.all_indexes = [idx['index'] for idx in self.es_conn.cat.indices(index=pattern, format='json', pri=True)]
-        first = self.index_for_when(pattern, start)
-        last = self.index_for_when(pattern, end)
+        self.fetch_indexes(pattern)
+        first = self.index_for_when(start)
+        last = self.index_for_when(end)
         if first is None or last is None:
             print('No indexes cover that time range')
             exit(1)
@@ -129,13 +128,13 @@ class Es2csv:
         use = False
         indexes = []
         for idx in self.all_indexes:
-            if idx == start:
+            if idx['index'] == first:
                 use = True
 
             if use:
-                indexes.append(idx)
+                indexes.append(idx['index'])
 
-            if idx == end:
+            if idx['index'] == last:
                 use = False
 
         return indexes
@@ -177,7 +176,8 @@ class Es2csv:
                 }
             else:
                 query_addition = ' AND @timestamp:["%s" TO "%s"]' % (self.opts.start_time.isoformat(), self.opts.end_time.isoformat())
-            print("Searching indexes %s with addition %r" % (indexes, query_addition))
+            if self.opts.debug_mode:
+                print("Searching indexes %s with addition %r" % (indexes, query_addition))
         else:
             indexes = ','.join(self.opts.index_prefixes)
 
@@ -205,7 +205,6 @@ class Es2csv:
                 if query_addition:
                     # we need to add the "range" inside a "bool -> must" list
                     query = { 'query': { 'bool': { 'must': [ query_addition, query['query'] ] } } }
-                    print('new query is: %s' % json.dumps(query))
             except ValueError as e:
                 print('Invalid JSON syntax in query. %s' % e)
                 exit(1)
@@ -405,7 +404,11 @@ def main():
     if (opts.start_time and not opts.end_time) or (opts.end_time and not opts.start_time):
         print("Must specify both start and end times")
         p.print_help()
-        exit()
+        exit(1)
+
+    if opts.start_time > opts.end_time:
+        print("Start time must be before end time")
+        exit(1)
 
     es = Es2csv(opts)
     es.create_connection()
